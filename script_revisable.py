@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from datasets import Value, load_dataset
+from datasets import DatasetDict, Value, load_dataset
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -112,9 +112,27 @@ print(tokenized_TFG["train"].column_names)
 # ============================================================
 
 
-def unify_label_column(dataset_dict):
-    """Garantiza que la variable objetivo se llame `labels`."""
-    for split in dataset_dict.keys():
+SUPERVISED_SPLITS = ("train", "validation", "test")
+INFERENCE_SPLITS = ("corpus", "corpus_sample")
+
+
+def validate_expected_splits(dataset_dict):
+    """Comprueba que estén los splits necesarios sin asumir etiquetas en inferencia."""
+    missing_supervised = [split for split in SUPERVISED_SPLITS if split not in dataset_dict]
+    if missing_supervised:
+        raise ValueError(f"Faltan splits supervisados obligatorios: {missing_supervised}")
+
+    available_inference = [split for split in INFERENCE_SPLITS if split in dataset_dict]
+    if not available_inference:
+        raise ValueError(
+            "No se encontró ningún split de inferencia: "
+            f"se esperaba al menos uno de {list(INFERENCE_SPLITS)}"
+        )
+
+
+def unify_label_column(dataset_dict, splits=SUPERVISED_SPLITS):
+    """Garantiza que la variable objetivo se llame `labels` en splits supervisados."""
+    for split in splits:
         cols = dataset_dict[split].column_names
 
         if "labels" in cols:
@@ -124,31 +142,55 @@ def unify_label_column(dataset_dict):
             continue
 
         raise ValueError(
-            f"El split '{split}' no contiene ni 'label' ni 'labels'. "
+            f"El split supervisado '{split}' no contiene ni 'label' ni 'labels'. "
             f"Columnas disponibles: {cols}"
         )
 
     return dataset_dict
 
 
-def ensure_binary_int_labels(dataset_dict):
+def ensure_binary_int_labels(dataset_dict, splits=SUPERVISED_SPLITS):
     """
-    Fuerza labels a int64 y comprueba que los valores sean estrictamente 0/1.
+    Fuerza labels a int64 y comprueba que los valores sean estrictamente 0/1
+    solo en train/validation/test. Los corpus de inferencia pueden no estar etiquetados.
     """
-    for split in dataset_dict.keys():
+    for split in splits:
         dataset_dict[split] = dataset_dict[split].cast_column("labels", Value("int64"))
         unique_labels = set(dataset_dict[split]["labels"])
 
         if not unique_labels.issubset({0, 1}):
             raise ValueError(
-                f"El split '{split}' contiene etiquetas no binarias: {sorted(unique_labels)}"
+                f"El split supervisado '{split}' contiene etiquetas no binarias: "
+                f"{sorted(unique_labels)}"
             )
 
-        print(f"Split '{split}' -> etiquetas válidas: {sorted(unique_labels)}")
+        print(f"Split supervisado '{split}' -> etiquetas válidas: {sorted(unique_labels)}")
 
     return dataset_dict
 
 
+def assert_no_manifesto_overlap(dataset_dict, splits=SUPERVISED_SPLITS):
+    """Evita leakage comprobando que cada manifesto_id aparece en un único split."""
+    manifesto_ids_by_split = {
+        split: set(dataset_dict[split]["manifesto_id"])
+        for split in splits
+    }
+
+    for i, split_a in enumerate(splits):
+        for split_b in splits[i + 1:]:
+            overlap = manifesto_ids_by_split[split_a] & manifesto_ids_by_split[split_b]
+            if overlap:
+                examples = sorted(str(item) for item in list(overlap)[:10])
+                raise ValueError(
+                    "Posible data leakage: hay manifesto_id compartidos entre "
+                    f"'{split_a}' y '{split_b}'. "
+                    f"Total solapados: {len(overlap)}. Ejemplos: {examples}"
+                )
+
+    print("Comprobación de leakage por manifesto_id superada para train/validation/test.")
+
+
+validate_expected_splits(tokenized_TFG)
 tokenized_TFG = unify_label_column(tokenized_TFG)
 tokenized_TFG = ensure_binary_int_labels(tokenized_TFG)
 
@@ -156,27 +198,38 @@ tokenized_TFG = ensure_binary_int_labels(tokenized_TFG)
 # 4. COLUMNAS PARA TRAINER
 # ============================================================
 
-model_columns = ["input_ids", "attention_mask", "labels"]
+base_model_columns = ["input_ids", "attention_mask"]
 if "token_type_ids" in tokenized_TFG["train"].column_names:
-    model_columns.append("token_type_ids")
+    base_model_columns.append("token_type_ids")
 
 id_columns = [
     col for col in ["manifesto_id", "pos", "id", "text_en"]
     if col in tokenized_TFG["train"].column_names
 ]
 
-# Dataset que entra al Trainer
-trainer_TFG = tokenized_TFG.select_columns(model_columns)
-
-# Comprobaciones
-for split in trainer_TFG.keys():
-    print(f"Columnas del modelo en {split}: {trainer_TFG[split].column_names}")
-
 required_id_cols = ["manifesto_id", "pos"]
 for split in tokenized_TFG.keys():
     missing = [col for col in required_id_cols if col not in tokenized_TFG[split].column_names]
     if missing:
         raise ValueError(f"Faltan columnas de identificación en {split}: {missing}")
+
+assert_no_manifesto_overlap(tokenized_TFG)
+
+# Dataset que entra al Trainer. Train/validation/test mantienen labels; corpus/corpus_sample
+# no las requieren, para poder aplicar el modelo a datos nuevos no etiquetados.
+trainer_TFG = DatasetDict()
+for split in tokenized_TFG.keys():
+    split_model_columns = list(base_model_columns)
+    if split in SUPERVISED_SPLITS:
+        split_model_columns.append("labels")
+    elif "labels" in tokenized_TFG[split].column_names:
+        split_model_columns.append("labels")
+
+    trainer_TFG[split] = tokenized_TFG[split].select_columns(split_model_columns)
+
+# Comprobaciones
+for split in trainer_TFG.keys():
+    print(f"Columnas del modelo en {split}: {trainer_TFG[split].column_names}")
 
 print(f"Columnas auxiliares disponibles para agregación posterior: {id_columns}")
 
@@ -1048,7 +1101,6 @@ trainer_eval = Trainer(
     model=final_model,
     args=final_args,
     data_collator=data_collator,
-    compute_metrics=compute_metrics,
 )
 
 # =========================================
