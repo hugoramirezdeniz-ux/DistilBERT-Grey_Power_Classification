@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Entornos virtuales
+.env
+.venv/
+venv/
+
+# Google Colab / Jupyter
+.ipynb_checkpoints/
+
+# Hugging Face / Trainer outputs
+checkpoint-*/
+outputs_phase1/
+outputs_phase2/
+trainer_output/
+runs/
+wandb/
+
+# Modelos entrenados pesados
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Datos completos: no subir al repositorio
+data/
+corpus/
+full_corpus/
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
